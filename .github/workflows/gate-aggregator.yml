@@ -1,0 +1,22 @@
+name: Gate Aggregator
+
+on:
+  check_suite:
+    types: [completed]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  event-handler:
+    permissions:
+      statuses: write
+      pull-requests: write
+      checks: read
+    name: Handle ${{ github.event_name }} ${{ github.event.action }} event
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Azure/azure-sdk-actions@1dc8fee9eaf3a8af294f4b299b0ebb3c6745bd2e
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
