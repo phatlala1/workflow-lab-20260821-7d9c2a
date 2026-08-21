@@ -1,0 +1,16 @@
+name: Failing CI Control
+
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  fail:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deterministic failure
+        shell: bash
+        run: |
+          echo "Deterministic failing control"
+          exit 1
