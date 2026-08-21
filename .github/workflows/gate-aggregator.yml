@@ -1,4 +1,4 @@
-name: Gate Aggregator
+name: Gate Aggregator Patched
 
 on:
   check_suite:
@@ -17,6 +17,55 @@ jobs:
     name: Handle ${{ github.event_name }} ${{ github.event.action }} event
     runs-on: ubuntu-latest
     steps:
-      - uses: Azure/azure-sdk-actions@1dc8fee9eaf3a8af294f4b299b0ebb3c6745bd2e
+      - name: Authorize privileged override
+        id: authorize
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            if (context.eventName !== 'issue_comment') {
+              core.setOutput('allowed', 'true');
+              return;
+            }
+
+            const body = (context.payload.comment?.body || '').trim().toLowerCase();
+            if (!body.startsWith('/check-enforcer override')) {
+              core.setOutput('allowed', 'true');
+              return;
+            }
+
+            const login = context.payload.comment?.user?.login || '';
+            const association = context.payload.comment?.author_association || '';
+            const trustedAssociation = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association);
+            if (!login || !trustedAssociation) {
+              core.notice(`Override denied for untrusted association: ${association || '<missing>'}`);
+              core.setOutput('allowed', 'false');
+              return;
+            }
+
+            let permission = 'none';
+            try {
+              const response = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: login,
+              });
+              permission = response.data.user?.permissions?.admin ? 'admin'
+                : response.data.user?.permissions?.maintain ? 'maintain'
+                : response.data.user?.permissions?.push ? 'write'
+                : response.data.permission || 'none';
+            } catch (error) {
+              core.notice(`Override permission lookup failed closed: ${error.status || 'unknown'}`);
+              core.setOutput('allowed', 'false');
+              return;
+            }
+
+            const allowed = ['write', 'maintain', 'admin'].includes(permission);
+            core.notice(`Override authorization decision for ${login}: ${allowed ? 'allowed' : 'denied'}`);
+            core.setOutput('allowed', allowed ? 'true' : 'false');
+
+      - name: Run aggregate status action
+        if: steps.authorize.outputs.allowed == 'true'
+        uses: Azure/azure-sdk-actions@1dc8fee9eaf3a8af294f4b299b0ebb3c6745bd2e
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
