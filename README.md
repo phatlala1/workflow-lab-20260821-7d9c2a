@@ -1,2 +1,6 @@
 # workflow-lab-20260821-7d9c2a
-Authorized disposable security-validation lab for Azure SDK check-enforcer authorization testing. No production targets.
+
+Authorized outsider baseline PR.
+
+Marker: OUTSIDER_BASELINE_7D9C2A
+Marker: PROTECTED_HEAD_EXPECTED_7D9C2A
