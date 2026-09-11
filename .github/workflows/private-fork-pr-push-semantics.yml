@@ -25,7 +25,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: "2"
+          PR_NUMBER: "1"
         run: |
           set -euo pipefail
           evidence="$RUNNER_TEMP/fork-pr-semantics"
@@ -33,15 +33,15 @@ jobs:
 
           base_repo="$GITHUB_REPOSITORY"
           before_origin=$(git remote get-url origin)
-          before_branch=$(git rev-parse --abbrev-ref HEAD)
           pr_json=$(gh pr view "$PR_NUMBER" --json number,state,headRefName,headRepository,baseRefName,headRefOid)
           printf '%s\n' "$pr_json" > "$evidence/pr-before.json"
 
+          pr_state=$(printf '%s' "$pr_json" | jq -r '.state')
           head_repo=$(printf '%s' "$pr_json" | jq -r '.headRepository.nameWithOwner')
           head_branch=$(printf '%s' "$pr_json" | jq -r '.headRefName')
           head_sha=$(printf '%s' "$pr_json" | jq -r '.headRefOid')
           test "$head_repo" != "$base_repo"
-          test "$head_branch" = "patched-control-7d9c2a"
+          test "$head_branch" = "outsider-baseline-7d9c2a"
 
           # Exact command used by the target workflow.
           gh pr checkout "$PR_NUMBER"
@@ -90,11 +90,11 @@ jobs:
 
           cat > "$evidence/final.json" <<JSON
           {
-            "schema": "authorized-fork-pr-base-push-semantics-1",
+            "schema": "authorized-fork-pr-base-push-semantics-2",
             "runId": "$GITHUB_RUN_ID",
             "baseRepository": "$base_repo",
             "sourcePullRequest": $PR_NUMBER,
-            "sourcePullRequestState": "open",
+            "sourcePullRequestState": "$pr_state",
             "sourceHeadRepository": "$head_repo",
             "sourceHeadBranch": "$head_branch",
             "sourceHeadSha": "$head_sha",
@@ -103,13 +103,14 @@ jobs:
             "originBeforeCheckout": "$before_origin",
             "originAfterCheckout": "$after_origin",
             "baseBranchAbsentBefore": true,
+            "sourcePullRequestChangedWorkflow": false,
             "exactPushCommandShape": "git push origin HEAD:<checkout-branch>",
             "baseBranchCreated": true,
             "baseBranchProofCommit": "$base_after",
             "forkBranchUnchanged": true,
             "forkBranchShaAfter": "$fork_after",
             "contentsWritePermission": true,
-            "classification": "FORK_PR_CHECKOUT_PUSHES_ATTESTED_CONTENT_TO_BASE_REPOSITORY_BRANCH"
+            "classification": "FORK_PR_CHECKOUT_PUSHES_ATTESTED_NON_WORKFLOW_CONTENT_TO_BASE_REPOSITORY_BRANCH"
           }
           JSON
 
