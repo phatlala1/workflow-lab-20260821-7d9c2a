@@ -1,0 +1,41 @@
+name: cache-dotnet-sdk-11rc1
+
+on:
+  push:
+    branches:
+      - tooling/dotnet-sdk-11rc1-cache-20260920
+    paths:
+      - .github/workflows/cache-dotnet-sdk-11rc1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Download official SDK archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          url='https://builds.dotnet.microsoft.com/dotnet/Sdk/11.0.100-rc.1.26425.128/dotnet-sdk-11.0.100-rc.1.26425.128-linux-x64.tar.gz'
+          expected='608518577aab9db33db92ebd74f0fc9bfbcc7b3d473619f4731aca2edba80af6c571a38d5be6994862fc4679f6f3d13db767712fcb6f70a7683974a18824a0cc'
+          curl --fail --location --retry 5 --retry-delay 3 --output dotnet-sdk.tar.gz "$url"
+          actual=$(sha512sum dotnet-sdk.tar.gz | awk '{print $1}')
+          test "$actual" = "$expected"
+          printf '%s  %s\n' "$actual" dotnet-sdk.tar.gz > SHA512SUMS.txt
+          tar -tzf dotnet-sdk.tar.gz >/dev/null
+          ls -lh dotnet-sdk.tar.gz SHA512SUMS.txt
+
+      - name: Upload verified SDK archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-sdk-11.0.100-rc.1.26425.128-linux-x64
+          path: |
+            dotnet-sdk.tar.gz
+            SHA512SUMS.txt
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
