@@ -61,7 +61,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Wait for encrypted payload
+      - name: Wait for encrypted payload bound to this run
         id: wait_payload
         shell: bash
         run: |
@@ -74,11 +74,21 @@ jobs:
             if git cat-file -e FETCH_HEAD:encrypted-input/payload.enc.b64 2>/dev/null \
               && git cat-file -e FETCH_HEAD:encrypted-input/wrapped-key.b64 2>/dev/null \
               && git cat-file -e FETCH_HEAD:encrypted-input/manifest.json 2>/dev/null; then
-              git show FETCH_HEAD:encrypted-input/payload.enc.b64 > /tmp/encrypted-input/payload.enc.b64
-              git show FETCH_HEAD:encrypted-input/wrapped-key.b64 > /tmp/encrypted-input/wrapped-key.b64
-              git show FETCH_HEAD:encrypted-input/manifest.json > /tmp/encrypted-input/manifest.json
-              found=1
-              break
+              git show FETCH_HEAD:encrypted-input/manifest.json > /tmp/encrypted-input/manifest.candidate.json
+              candidate_run_id=$(python3 - <<'PY'
+          import json
+          print(json.load(open('/tmp/encrypted-input/manifest.candidate.json')).get('runId', ''))
+          PY
+              )
+              if [[ "$candidate_run_id" == "$GITHUB_RUN_ID" ]]; then
+                git show FETCH_HEAD:encrypted-input/payload.enc.b64 > /tmp/encrypted-input/payload.enc.b64
+                git show FETCH_HEAD:encrypted-input/wrapped-key.b64 > /tmp/encrypted-input/wrapped-key.b64
+                mv /tmp/encrypted-input/manifest.candidate.json /tmp/encrypted-input/manifest.json
+                found=1
+                break
+              fi
+              rm -f /tmp/encrypted-input/manifest.candidate.json
+              echo "Ignoring stale encrypted payload for run ${candidate_run_id:-unknown}"
             fi
             echo "Waiting for encrypted payload: attempt ${attempt}/120"
             sleep 10
@@ -109,7 +119,7 @@ jobs:
             -pkeyopt rsa_oaep_md:sha256 \
             -in /tmp/wrapped-key.bin \
             -out /tmp/key-material.txt
-          IFS=: read -r aes_key aes_iv < /tmp/key-material.txt
+          IFS=: read -r aes_key aes_iv < /tmp/key-material.txt || true
           [[ "$aes_key" =~ ^[0-9a-f]{64}$ ]]
           [[ "$aes_iv" =~ ^[0-9a-f]{32}$ ]]
           openssl enc -d -aes-256-cbc \
@@ -191,7 +201,7 @@ jobs:
             -out /tmp/result.enc
           openssl pkeyutl -encrypt \
             -pubin \
-            -inkey /tmp/private-payload/handoff/result-public.pem \
+            -inkey "$GITHUB_WORKSPACE/handoff-result-public.pem" \
             -pkeyopt rsa_padding_mode:oaep \
             -pkeyopt rsa_oaep_md:sha256 \
             -in /tmp/result-key-material.txt \
