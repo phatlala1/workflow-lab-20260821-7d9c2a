@@ -1,0 +1,67 @@
+name: cache-dbsc-nuget-packages
+
+on:
+  push:
+    branches:
+      - tooling/dotnet-sdk-11rc1-cache-20260920
+    paths:
+      - .github/workflows/cache-dbsc-nuget-packages.yml
+      - nuget-cache/DbscPackageCache.csproj
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  restore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install verified official .NET 11 RC1 SDK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          url='https://builds.dotnet.microsoft.com/dotnet/Sdk/11.0.100-rc.1.26425.128/dotnet-sdk-11.0.100-rc.1.26425.128-linux-x64.tar.gz'
+          expected='608518577aab9db33db92ebd74f0fc9bfbcc7b3d473619f4731aca2edba80af6c571a38d5be6994862fc4679f6f3d13db767712fcb6f70a7683974a18824a0cc'
+          curl --fail --location --retry 5 --retry-delay 3 --output /tmp/dotnet-sdk.tar.gz "$url"
+          actual=$(sha512sum /tmp/dotnet-sdk.tar.gz | awk '{print $1}')
+          test "$actual" = "$expected"
+          mkdir -p "$RUNNER_TEMP/dotnet11"
+          tar -xzf /tmp/dotnet-sdk.tar.gz -C "$RUNNER_TEMP/dotnet11"
+          echo "DOTNET_ROOT=$RUNNER_TEMP/dotnet11" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/dotnet11" >> "$GITHUB_PATH"
+
+      - name: Restore exact public package graph
+        shell: bash
+        env:
+          NUGET_PACKAGES: ${{ runner.temp }}/dbsc-nuget-packages
+          DOTNET_CLI_HOME: ${{ runner.temp }}/dotnet-home
+          DOTNET_NOLOGO: '1'
+        run: |
+          set -Eeuo pipefail
+          test "$(dotnet --version)" = '11.0.100-rc.1.26425.128'
+          dotnet restore nuget-cache/DbscPackageCache.csproj --use-lock-file --force-evaluate -v:minimal
+          dotnet list nuget-cache/DbscPackageCache.csproj package --include-transitive > nuget-cache/package-list.txt
+          cp nuget-cache/packages.lock.json "$RUNNER_TEMP/dbsc-nuget-packages/"
+          cp nuget-cache/package-list.txt "$RUNNER_TEMP/dbsc-nuget-packages/"
+          printf '%s\n' '11.0.100-rc.1.26425.128' > "$RUNNER_TEMP/dbsc-nuget-packages/SDK_VERSION.txt"
+          (
+            cd "$RUNNER_TEMP"
+            tar -czf dbsc-nuget-packages.tar.gz dbsc-nuget-packages
+          )
+          sha256sum "$RUNNER_TEMP/dbsc-nuget-packages.tar.gz" > "$RUNNER_TEMP/dbsc-nuget-packages.tar.gz.sha256"
+          find "$NUGET_PACKAGES" -maxdepth 2 -type d | sort
+          ls -lh "$RUNNER_TEMP/dbsc-nuget-packages.tar.gz" "$RUNNER_TEMP/dbsc-nuget-packages.tar.gz.sha256"
+
+      - name: Upload verified public package cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbsc-nuget-packages-0.11.0-rc.1.26425.128
+          path: |
+            ${{ runner.temp }}/dbsc-nuget-packages.tar.gz
+            ${{ runner.temp }}/dbsc-nuget-packages.tar.gz.sha256
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
