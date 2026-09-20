@@ -1,0 +1,221 @@
+name: ephemeral-wsfed-run3
+
+on:
+  push:
+    branches:
+      - research/ephemeral-wsfed-eop-20260920-r1
+    paths:
+      - .github/workflows/ephemeral-wsfed-run3.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out handoff branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Generate one-run payload key
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p /tmp/private-result handoff-run3-public
+          printf '%s\n' 'GENERATING_PAYLOAD_KEY' > /tmp/private-result/STAGE.txt
+          openssl genpkey \
+            -algorithm RSA \
+            -pkeyopt rsa_keygen_bits:3072 \
+            -out /tmp/run3-private.pem \
+            2>/dev/null
+          chmod 600 /tmp/run3-private.pem
+          openssl pkey \
+            -in /tmp/run3-private.pem \
+            -pubout \
+            -out handoff-run3-public/public.pem
+          openssl rand -hex 32 > handoff-run3-public/challenge.txt
+          cat > handoff-run3-public/metadata.json <<EOF
+          {
+            "runId": "${GITHUB_RUN_ID}",
+            "runAttempt": "${GITHUB_RUN_ATTEMPT}",
+            "branch": "${GITHUB_REF_NAME}",
+            "commit": "${GITHUB_SHA}"
+          }
+          EOF
+          sha256sum handoff-run3-public/* > handoff-run3-public/SHA256SUMS.txt
+          printf '%s\n' 'WAITING_FOR_ENCRYPTED_PAYLOAD' > /tmp/private-result/STAGE.txt
+
+      - name: Upload one-run public key
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephemeral-wsfed-run3-public-${{ github.run_id }}
+          path: handoff-run3-public
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Wait for run-bound encrypted payload
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p /tmp/run3-input
+          found=0
+          for attempt in $(seq 1 120); do
+            git fetch --quiet --depth=1 origin "${GITHUB_REF_NAME}"
+            if git cat-file -e FETCH_HEAD:encrypted-run3/payload.enc.b64 2>/dev/null \
+              && git cat-file -e FETCH_HEAD:encrypted-run3/wrapped-key.b64 2>/dev/null \
+              && git cat-file -e FETCH_HEAD:encrypted-run3/manifest.json 2>/dev/null; then
+              git show FETCH_HEAD:encrypted-run3/manifest.json > /tmp/run3-input/manifest.candidate.json
+              candidate_run_id=$(python3 - <<'PY'
+          import json
+          print(json.load(open('/tmp/run3-input/manifest.candidate.json')).get('runId', ''))
+          PY
+              )
+              if [[ "$candidate_run_id" == "$GITHUB_RUN_ID" ]]; then
+                git show FETCH_HEAD:encrypted-run3/payload.enc.b64 > /tmp/run3-input/payload.enc.b64
+                git show FETCH_HEAD:encrypted-run3/wrapped-key.b64 > /tmp/run3-input/wrapped-key.b64
+                mv /tmp/run3-input/manifest.candidate.json /tmp/run3-input/manifest.json
+                found=1
+                break
+              fi
+              rm -f /tmp/run3-input/manifest.candidate.json
+            fi
+            echo "Waiting for payload: ${attempt}/120"
+            sleep 10
+          done
+          if [[ "$found" -ne 1 ]]; then
+            printf '%s\n' 'PAYLOAD_TIMEOUT' > /tmp/private-result/STAGE.txt
+            exit 12
+          fi
+          printf '%s\n' 'DECRYPTING_PAYLOAD' > /tmp/private-result/STAGE.txt
+
+      - name: Decrypt and verify private PoC
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          base64 -d /tmp/run3-input/payload.enc.b64 > /tmp/run3-payload.enc
+          base64 -d /tmp/run3-input/wrapped-key.b64 > /tmp/run3-wrapped-key.bin
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/run3-private.pem \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/run3-wrapped-key.bin \
+            -out /tmp/run3-key-material.txt
+          IFS=: read -r aes_key aes_iv < /tmp/run3-key-material.txt || true
+          [[ "$aes_key" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$aes_iv" =~ ^[0-9a-f]{32}$ ]]
+          openssl enc -d -aes-256-cbc \
+            -K "$aes_key" \
+            -iv "$aes_iv" \
+            -in /tmp/run3-payload.enc \
+            -out /tmp/run3-payload.zip
+          expected_sha=$(python3 - <<'PY'
+          import json
+          print(json.load(open('/tmp/run3-input/manifest.json'))['payloadSha256'])
+          PY
+          )
+          actual_sha=$(sha256sum /tmp/run3-payload.zip | awk '{print $1}')
+          test "$actual_sha" = "$expected_sha"
+          rm -rf /tmp/run3-payload-dir
+          mkdir -p /tmp/run3-payload-dir
+          unzip -q /tmp/run3-payload.zip -d /tmp/run3-payload-dir
+          test -f /tmp/run3-payload-dir/project/run.sh
+          test -f /tmp/run3-payload-dir/project/Program.cs
+          printf '%s\n' 'PAYLOAD_VERIFIED' > /tmp/private-result/STAGE.txt
+          printf '%s\n' "$actual_sha" > /tmp/private-result/PAYLOAD_SHA256.txt
+
+      - name: Install exact .NET SDK 10.0.401
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.401
+
+      - name: Execute exact shipped-product PoC
+        id: execute
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf '%s\n' 'EXECUTING_POC' > /tmp/private-result/STAGE.txt
+          chmod +x /tmp/run3-payload-dir/project/run.sh
+          set +e
+          (
+            cd /tmp/run3-payload-dir/project
+            ./run.sh
+          ) > /tmp/private-result/stdout.log 2> /tmp/private-result/stderr.log
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > /tmp/private-result/harness-exit-code.txt
+          dotnet --info > /tmp/private-result/dotnet-info.txt 2>&1 || true
+          cp -a /tmp/run3-payload-dir/project/evidence /tmp/private-result/evidence 2>/dev/null || true
+          cp -a /tmp/run3-payload-dir/project/PACKAGE_VALIDATION.json /tmp/private-result/ 2>/dev/null || true
+          cp -a /tmp/run3-payload-dir/project/STATIC_VALIDATION.json /tmp/private-result/ 2>/dev/null || true
+          cat > /tmp/private-result/RUNNER_STATUS.json <<EOF
+          {
+            "runId": "${GITHUB_RUN_ID}",
+            "runAttempt": "${GITHUB_RUN_ATTEMPT}",
+            "sourceCommit": "${GITHUB_SHA}",
+            "runnerOS": "${RUNNER_OS}",
+            "runnerArch": "${RUNNER_ARCH}",
+            "harnessExitCode": ${rc}
+          }
+          EOF
+          printf '%s\n' 'EXECUTION_FINISHED' > /tmp/private-result/STAGE.txt
+          echo "harness_exit_code=${rc}" >> "$GITHUB_OUTPUT"
+
+      - name: Encrypt terminal evidence
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p /tmp/run3-result-upload /tmp/private-result
+          tar -C /tmp -czf /tmp/run3-private-result.tar.gz private-result
+          result_sha=$(sha256sum /tmp/run3-private-result.tar.gz | awk '{print $1}')
+          aes_key=$(openssl rand -hex 32)
+          aes_iv=$(openssl rand -hex 16)
+          printf '%s:%s' "$aes_key" "$aes_iv" > /tmp/run3-result-key-material.txt
+          openssl enc -aes-256-cbc \
+            -K "$aes_key" \
+            -iv "$aes_iv" \
+            -in /tmp/run3-private-result.tar.gz \
+            -out /tmp/run3-result.enc
+          openssl pkeyutl -encrypt \
+            -pubin \
+            -inkey "$GITHUB_WORKSPACE/handoff-result-public.pem" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/run3-result-key-material.txt \
+            -out /tmp/run3-result-wrapped-key.bin
+          base64 -w0 /tmp/run3-result.enc > /tmp/run3-result-upload/result.enc.b64
+          base64 -w0 /tmp/run3-result-wrapped-key.bin > /tmp/run3-result-upload/result-wrapped-key.b64
+          cat > /tmp/run3-result-upload/result-manifest.json <<EOF
+          {
+            "runId": "${GITHUB_RUN_ID}",
+            "runAttempt": "${GITHUB_RUN_ATTEMPT}",
+            "cipher": "AES-256-CBC+RSA-OAEP-SHA256",
+            "plaintextSha256": "${result_sha}",
+            "harnessExitCode": "${{ steps.execute.outputs.harness_exit_code }}"
+          }
+          EOF
+          sha256sum /tmp/run3-result-upload/* > /tmp/run3-result-upload/SHA256SUMS.txt
+          rm -rf /tmp/run3-payload-dir /tmp/private-result
+          rm -f /tmp/run3-private.pem /tmp/run3-key-material.txt /tmp/run3-result-key-material.txt
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephemeral-wsfed-run3-result-${{ github.run_id }}
+          path: /tmp/run3-result-upload
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Set terminal workflow verdict
+        if: always()
+        shell: bash
+        run: |
+          rc='${{ steps.execute.outputs.harness_exit_code }}'
+          case "$rc" in
+            0|3) exit 0 ;;
+            *) exit 1 ;;
+          esac
