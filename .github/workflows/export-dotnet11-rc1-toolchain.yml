@@ -1,0 +1,65 @@
+name: export-dotnet11-rc1-toolchain
+
+on:
+  push:
+    branches:
+      - tooling/dotnet11-rc1-export
+    paths:
+      - .github/workflows/export-dotnet11-rc1-toolchain.yml
+      - toolchain-export/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 11.0.100-rc.1.26425.128
+      - name: Restore exact stock packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(dotnet --version)" = "11.0.100-rc.1.26425.128"
+          dotnet --info | tee dotnet-info.txt
+          dotnet restore toolchain-export/toolchain-export.csproj --use-lock-file --force-evaluate
+          dotnet list toolchain-export/toolchain-export.csproj package --include-transitive | tee package-list.txt
+      - name: Pack toolchain and package cache
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p export
+          DOTNET_ROOT_RESOLVED="$(dirname "$(readlink -f "$(command -v dotnet)")")"
+          printf '%s\n' "$DOTNET_ROOT_RESOLVED" > export/DOTNET_ROOT.txt
+          cp dotnet-info.txt package-list.txt toolchain-export/packages.lock.json export/
+          tar -C "$DOTNET_ROOT_RESOLVED" -czf export/dotnet11-rc1-linux-x64.tar.gz .
+          tar -C "$HOME/.nuget/packages" -czf export/nuget-passkey-ef-rc1.tar.gz \
+            microsoft.aspnetcore.identity.entityframeworkcore/11.0.0-rc.1.26425.128 \
+            microsoft.entityframeworkcore.inmemory/11.0.0-rc.1.26425.128 \
+            microsoft.entityframeworkcore/11.0.0-rc.1.26425.128 \
+            microsoft.entityframeworkcore.abstractions/11.0.0-rc.1.26425.128 \
+            microsoft.extensions.caching.memory/11.0.0-rc.1.26425.128 \
+            microsoft.extensions.caching.abstractions/11.0.0-rc.1.26425.128 \
+            microsoft.extensions.dependencyinjection/11.0.0-rc.1.26425.128 \
+            microsoft.extensions.dependencyinjection.abstractions/11.0.0-rc.1.26425.128 \
+            microsoft.extensions.logging/11.0.0-rc.1.26425.128 \
+            microsoft.extensions.logging.abstractions/11.0.0-rc.1.26425.128 \
+            microsoft.extensions.options/11.0.0-rc.1.26425.128 \
+            microsoft.extensions.primitives/11.0.0-rc.1.26425.128 \
+            2>/dev/null || {
+              echo 'Exact dependency subset changed; exporting the complete NuGet cache instead.'
+              tar -C "$HOME/.nuget/packages" -czf export/nuget-passkey-ef-rc1.tar.gz .
+            }
+          sha256sum export/*.tar.gz > export/SHA256SUMS.txt
+          du -h export/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dotnet11-rc1-toolchain-${{ github.run_id }}
+          path: export
+          if-no-files-found: error
+          retention-days: 3
