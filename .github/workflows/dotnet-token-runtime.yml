@@ -40,6 +40,9 @@ jobs:
           EOF
           test "$(dotnet --version)" = "11.0.100-rc.1.26425.128"
           dotnet --info | tee dotnet-info.txt
+          # Harness-only compatibility corrections. Product/framework binaries stay stock.
+          sed -Ei 's/using var ([A-Za-z_][A-Za-z0-9_]*) = new CookieContainer\(\);/var \1 = new CookieContainer();/g' passkey-runtime/Program.cs
+          sed -i 's/padded.Length % 4 switch/(padded.Length % 4) switch/' passkey-runtime/SyntheticPasskey.cs
           dotnet restore passkey-runtime/PasskeyRuntime.csproj --use-lock-file --force-evaluate
           dotnet build passkey-runtime/PasskeyRuntime.csproj -c Release --no-restore -v:minimal
           sha256sum \
@@ -67,8 +70,6 @@ jobs:
             rc=$?
             set -e
             printf '%s\n' "$rc" > "$out/exit-code.txt"
-            # Harness contract: 3 means positive with all controls, 0 means negative with controls,
-            # and 2 means a harness/control failure.
             if [[ "$rc" -eq 2 ]]; then
               cat "$out/stderr.txt" >&2
               exit 2
@@ -80,7 +81,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           python3 - <<'PY'
-          import hashlib, json, pathlib, sys
+          import hashlib, json, pathlib
           root = pathlib.Path('evidence-passkey')
           summaries = []
           nonces = set()
