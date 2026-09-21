@@ -6,24 +6,152 @@ on:
       - research/dotnet-token-runtime-20260921
     paths:
       - .github/workflows/dotnet-token-runtime.yml
-      - token-runtime/**
+      - passkey-runtime/**
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  validate:
+  validate-passkey-boundary:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - name: Check out disposable owned lab
+        uses: actions/checkout@v4
+
+      - name: Install exact .NET 11 RC1 SDK
+        uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.401
-      - name: Verify exact SDK
+          dotnet-version: 11.0.100-rc.1.26425.128
+
+      - name: Pin environment and build stock framework harness
         shell: bash
         run: |
           set -Eeuo pipefail
-          test "$(dotnet --version)" = "10.0.401"
-          dotnet --info
+          cat > global.json <<'EOF'
+          {
+            "sdk": {
+              "version": "11.0.100-rc.1.26425.128",
+              "rollForward": "disable",
+              "allowPrerelease": true
+            }
+          }
+          EOF
+          test "$(dotnet --version)" = "11.0.100-rc.1.26425.128"
+          dotnet --info | tee dotnet-info.txt
+          dotnet restore passkey-runtime/PasskeyRuntime.csproj --use-lock-file --force-evaluate
+          dotnet build passkey-runtime/PasskeyRuntime.csproj -c Release --no-restore -v:minimal
+          sha256sum \
+            global.json \
+            passkey-runtime/PasskeyRuntime.csproj \
+            passkey-runtime/Program.cs \
+            passkey-runtime/LabIdentity.cs \
+            passkey-runtime/SyntheticPasskey.cs \
+            > source-sha256.txt
+
+      - name: Run three fresh exact-product trials
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf evidence-passkey
+          mkdir -p evidence-passkey
+          for trial in 1 2 3; do
+            out="evidence-passkey/trial-${trial}"
+            mkdir -p "$out"
+            set +e
+            dotnet run \
+              --project passkey-runtime/PasskeyRuntime.csproj \
+              -c Release --no-build -- "$out" \
+              >"$out/console.txt" 2>"$out/stderr.txt"
+            rc=$?
+            set -e
+            printf '%s\n' "$rc" > "$out/exit-code.txt"
+            # Harness contract: 3 means positive with all controls, 0 means negative with controls,
+            # and 2 means a harness/control failure.
+            if [[ "$rc" -eq 2 ]]; then
+              cat "$out/stderr.txt" >&2
+              exit 2
+            fi
+          done
+
+      - name: Independently verify terminal evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib, sys
+          root = pathlib.Path('evidence-passkey')
+          summaries = []
+          nonces = set()
+          for trial in range(1, 4):
+              p = root / f'trial-{trial}' / 'RESULT.json'
+              if not p.exists():
+                  raise SystemExit(f'missing {p}')
+              obj = json.loads(p.read_text())
+              attack = obj['Attack']
+              controls = obj['Controls']
+              assert obj['Verdict'] == 'POSITIVE_OFFICIAL_SAMPLE_UNAUTHENTICATED_PASSKEY_ENROLLMENT_TAKES_OVER_EXISTING_ADMIN', obj['Verdict']
+              assert obj['Positive'] is True
+              assert controls['AllPassed'] is True
+              assert attack['ExistingAdminSelected'] is True
+              assert attack['CredentialOwnerIsAdmin'] is True
+              assert attack['LoginStatus'] == 200
+              assert attack['MeAuthenticated'] is True
+              assert attack['MeRole'] == 'admin'
+              assert attack['AdminStatus'] == 200
+              assert attack['AdminMarkerObserved'] is True
+              nonce = obj['RunNonce']
+              assert nonce not in nonces
+              nonces.add(nonce)
+              summaries.append({
+                  'trial': trial,
+                  'nonceSha256': hashlib.sha256(nonce.encode()).hexdigest(),
+                  'verdict': obj['Verdict'],
+                  'positive': obj['Positive'],
+                  'controlsPassed': controls['AllPassed'],
+                  'adminStatus': attack['AdminStatus'],
+                  'adminMarkerObserved': attack['AdminMarkerObserved'],
+                  'credentialOwnerIsAdmin': attack['CredentialOwnerIsAdmin'],
+                  'loadedAssemblies': obj['Assemblies'],
+              })
+          final = {
+              'schema': 'passkey-existing-user-takeover-three-trial-audit-v1',
+              'candidateId': 'DOTNET-ASPNETCORE-PASSKEY-SAMPLE-EXISTING-USER-TAKEOVER-20260920-R1',
+              'verdict': 'POSITIVE_3_OF_3_WITH_MATCHED_CONTROLS',
+              'freshNonceCount': len(nonces),
+              'trials': summaries,
+          }
+          (root / 'THREE_TRIAL_AUDIT.json').write_text(json.dumps(final, indent=2) + '\n')
+          print(json.dumps(final, indent=2))
+          PY
+          cp dotnet-info.txt source-sha256.txt passkey-runtime/packages.lock.json evidence-passkey/
+          find evidence-passkey -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z | xargs -0 sha256sum > evidence-passkey/SHA256SUMS.txt
+          python3 - <<'PY'
+          import pathlib, re
+          patterns = [
+              re.compile(rb'gh[pousr]_[A-Za-z0-9_]{20,}'),
+              re.compile(rb'AKIA[0-9A-Z]{16}'),
+              re.compile(rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
+          ]
+          hits = []
+          for path in pathlib.Path('evidence-passkey').rglob('*'):
+              if not path.is_file():
+                  continue
+              data = path.read_bytes()
+              for pattern in patterns:
+                  if pattern.search(data):
+                      hits.append((str(path), pattern.pattern.decode('latin1')))
+          if hits:
+              raise SystemExit(f'secret scan hits: {hits}')
+          pathlib.Path('evidence-passkey/SECRET_SCAN_PASS.txt').write_text('PASS\n')
+          PY
+
+      - name: Upload immutable evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: passkey-boundary-${{ github.run_id }}
+          path: evidence-passkey
+          if-no-files-found: error
+          retention-days: 14
