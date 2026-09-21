@@ -57,10 +57,11 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          rm -rf evidence-passkey
-          mkdir -p evidence-passkey
+          evidence_root="$PWD/evidence-passkey"
+          rm -rf "$evidence_root"
+          mkdir -p "$evidence_root"
           for trial in 1 2 3; do
-            out="evidence-passkey/trial-${trial}"
+            out="$evidence_root/trial-${trial}"
             mkdir -p "$out"
             set +e
             dotnet run \
@@ -70,6 +71,27 @@ jobs:
             rc=$?
             set -e
             printf '%s\n' "$rc" > "$out/exit-code.txt"
+            printf 'trial=%s exit=%s\n' "$trial" "$rc"
+            if [[ -f "$out/RESULT.json" ]]; then
+              python3 - "$out/RESULT.json" <<'PY'
+          import json, pathlib, sys
+          obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          print(json.dumps({
+              'verdict': obj.get('Verdict'),
+              'positive': obj.get('Positive'),
+              'controlsPassed': (obj.get('Controls') or {}).get('AllPassed'),
+              'adminStatus': (obj.get('Attack') or {}).get('AdminStatus'),
+              'adminMarkerObserved': (obj.get('Attack') or {}).get('AdminMarkerObserved'),
+              'credentialOwnerIsAdmin': (obj.get('Attack') or {}).get('CredentialOwnerIsAdmin'),
+          }, indent=2))
+          PY
+            else
+              echo "RESULT.json missing for trial $trial" >&2
+              cat "$out/stderr.txt" >&2 || true
+              exit 2
+            fi
+            # Harness contract: 3 = positive with all controls, 0 = negative with controls,
+            # and 2 = harness/control failure.
             if [[ "$rc" -eq 2 ]]; then
               cat "$out/stderr.txt" >&2
               exit 2
@@ -85,6 +107,7 @@ jobs:
           root = pathlib.Path('evidence-passkey')
           summaries = []
           nonces = set()
+          verdicts = []
           for trial in range(1, 4):
               p = root / f'trial-{trial}' / 'RESULT.json'
               if not p.exists():
@@ -92,16 +115,8 @@ jobs:
               obj = json.loads(p.read_text())
               attack = obj['Attack']
               controls = obj['Controls']
-              assert obj['Verdict'] == 'POSITIVE_OFFICIAL_SAMPLE_UNAUTHENTICATED_PASSKEY_ENROLLMENT_TAKES_OVER_EXISTING_ADMIN', obj['Verdict']
-              assert obj['Positive'] is True
+              verdicts.append(obj['Verdict'])
               assert controls['AllPassed'] is True
-              assert attack['ExistingAdminSelected'] is True
-              assert attack['CredentialOwnerIsAdmin'] is True
-              assert attack['LoginStatus'] == 200
-              assert attack['MeAuthenticated'] is True
-              assert attack['MeRole'] == 'admin'
-              assert attack['AdminStatus'] == 200
-              assert attack['AdminMarkerObserved'] is True
               nonce = obj['RunNonce']
               assert nonce not in nonces
               nonces.add(nonce)
@@ -114,12 +129,20 @@ jobs:
                   'adminStatus': attack['AdminStatus'],
                   'adminMarkerObserved': attack['AdminMarkerObserved'],
                   'credentialOwnerIsAdmin': attack['CredentialOwnerIsAdmin'],
+                  'existingAdminSelected': attack['ExistingAdminSelected'],
+                  'loginStatus': attack['LoginStatus'],
+                  'meAuthenticated': attack['MeAuthenticated'],
+                  'meRole': attack['MeRole'],
                   'loadedAssemblies': obj['Assemblies'],
               })
+          positive = all(v == 'POSITIVE_OFFICIAL_SAMPLE_UNAUTHENTICATED_PASSKEY_ENROLLMENT_TAKES_OVER_EXISTING_ADMIN' for v in verdicts)
+          negative = all(v == 'NEEDS_EVIDENCE_OR_NEGATIVE' for v in verdicts)
+          if not positive and not negative:
+              raise SystemExit(f'inconsistent verdicts: {verdicts}')
           final = {
-              'schema': 'passkey-existing-user-takeover-three-trial-audit-v1',
+              'schema': 'passkey-existing-user-takeover-three-trial-audit-v2',
               'candidateId': 'DOTNET-ASPNETCORE-PASSKEY-SAMPLE-EXISTING-USER-TAKEOVER-20260920-R1',
-              'verdict': 'POSITIVE_3_OF_3_WITH_MATCHED_CONTROLS',
+              'verdict': 'POSITIVE_3_OF_3_WITH_MATCHED_CONTROLS' if positive else 'NEGATIVE_3_OF_3_WITH_MATCHED_CONTROLS',
               'freshNonceCount': len(nonces),
               'trials': summaries,
           }
@@ -150,9 +173,10 @@ jobs:
           PY
 
       - name: Upload immutable evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: passkey-boundary-${{ github.run_id }}
           path: evidence-passkey
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
