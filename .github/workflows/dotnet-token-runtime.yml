@@ -1,0 +1,29 @@
+name: dotnet-token-runtime
+
+on:
+  push:
+    branches:
+      - research/dotnet-token-runtime-20260921
+    paths:
+      - .github/workflows/dotnet-token-runtime.yml
+      - token-runtime/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.401
+      - name: Verify exact SDK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(dotnet --version)" = "10.0.401"
+          dotnet --info
