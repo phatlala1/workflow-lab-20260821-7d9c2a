@@ -1,0 +1,27 @@
+@page "/control"
+@using Microsoft.AspNetCore.Http
+
+<h1>User plus role-header variation</h1>
+<p id="request-role">@CurrentRole</p>
+<p id="request-authenticated">@IsAuthenticated</p>
+
+<CacheView VaryByUser="true" VaryByHeader="X-Test-Role" ExpiresAfter="TimeSpan.FromMinutes(5)" CacheKey="control">
+    <p id="cache-render-id">@Guid.NewGuid().ToString("N")</p>
+    <AuthorizeView Roles="Admin">
+        <Authorized>
+            <p id="authorization-result">ADMIN</p>
+            <p id="admin-secret">@AdminSecret</p>
+        </Authorized>
+        <NotAuthorized>
+            <p id="authorization-result">DENIED</p>
+        </NotAuthorized>
+    </AuthorizeView>
+</CacheView>
+
+@code {
+    [CascadingParameter] private HttpContext? HttpContext { get; set; }
+
+    private string AdminSecret => Environment.GetEnvironmentVariable("MSRC_ADMIN_SECRET") ?? "MISSING_SECRET";
+    private bool IsAuthenticated => HttpContext?.User.Identity?.IsAuthenticated == true;
+    private string CurrentRole => HttpContext?.User.IsInRole("Admin") == true ? "Admin" : "User";
+}
