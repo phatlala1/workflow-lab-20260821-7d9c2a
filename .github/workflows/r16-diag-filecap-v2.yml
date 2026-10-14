@@ -1,0 +1,30 @@
+name: R16 .NET Diagnostics File-Capability Gate v2
+
+on:
+  push:
+    branches:
+      - msrc-r16-diag-filecap-v2-20261014
+
+permissions:
+  contents: read
+
+jobs:
+  filecap-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout isolated research branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Run corrected fail-closed matrix
+        shell: bash
+        run: bash r16/run.sh
+      - name: Upload sealed evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: r16-diag-filecap-v2-evidence
+          path: |
+            r16-output
+            r16-diag-filecap-evidence.tar.gz
+          if-no-files-found: error
+          retention-days: 7
