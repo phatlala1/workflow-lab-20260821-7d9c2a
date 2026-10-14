@@ -15,6 +15,19 @@ jobs:
     steps:
       - name: Checkout isolated research branch
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Apply orchestration-only shell fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('r16/run.sh')
+          s = p.read_text()
+          old = '  local name="$1" pid="$2" c="$OUT/cases/$name"\n'
+          new = '  local name="$1" pid="$2"\n  local c="$OUT/cases/$name"\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected exactly one orchestration line, got {s.count(old)}')
+          p.write_text(s.replace(old, new))
+          PY
       - name: Run corrected fail-closed matrix
         shell: bash
         run: bash r16/run.sh
