@@ -1,0 +1,76 @@
+name: Export .NET SDK 10.0.402
+
+on:
+  push:
+    paths:
+      - '.github/workflows/export-dotnet-sdk-10.0.402.yml'
+  pull_request:
+    paths:
+      - '.github/workflows/export-dotnet-sdk-10.0.402.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export-sdk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install exact .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.402'
+
+      - name: Stage exact SDK and runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet --info
+          ROOT="${DOTNET_ROOT:-$(dirname "$(readlink -f "$(command -v dotnet)")")}" 
+          OUT="$RUNNER_TEMP/dotnet-10.0.402"
+          mkdir -p "$OUT"
+
+          cp -a "$ROOT/dotnet" "$OUT/"
+          cp -a "$ROOT/host" "$OUT/"
+
+          mkdir -p "$OUT/sdk" "$OUT/shared/Microsoft.NETCore.App" "$OUT/shared/Microsoft.AspNetCore.App" "$OUT/packs"
+          cp -a "$ROOT/sdk/10.0.402" "$OUT/sdk/"
+          cp -a "$ROOT/shared/Microsoft.NETCore.App/10.0.13" "$OUT/shared/Microsoft.NETCore.App/"
+          cp -a "$ROOT/shared/Microsoft.AspNetCore.App/10.0.13" "$OUT/shared/Microsoft.AspNetCore.App/"
+
+          for pack in \
+            Microsoft.NETCore.App.Ref \
+            Microsoft.AspNetCore.App.Ref \
+            Microsoft.NETCore.App.Host.linux-x64; do
+            mkdir -p "$OUT/packs/$pack"
+            cp -a "$ROOT/packs/$pack/10.0.13" "$OUT/packs/$pack/"
+          done
+
+          if [ -d "$ROOT/sdk-manifests/10.0.100" ]; then
+            mkdir -p "$OUT/sdk-manifests"
+            cp -a "$ROOT/sdk-manifests/10.0.100" "$OUT/sdk-manifests/"
+          fi
+          if [ -d "$ROOT/metadata" ]; then
+            cp -a "$ROOT/metadata" "$OUT/"
+          fi
+
+          printf '%s\n' "10.0.402" > "$OUT/SDK_VERSION.txt"
+          printf '%s\n' "10.0.13" > "$OUT/RUNTIME_VERSION.txt"
+          find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/SDK_FILE_SHA256SUMS.txt"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/dotnet-sdk-10.0.402-linux-x64-min.tar.gz" dotnet-10.0.402
+          sha256sum "$RUNNER_TEMP/dotnet-sdk-10.0.402-linux-x64-min.tar.gz" | tee "$RUNNER_TEMP/ARCHIVE_SHA256.txt"
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-sdk-10.0.402-linux-x64-min
+          path: |
+            ${{ runner.temp }}/dotnet-sdk-10.0.402-linux-x64-min.tar.gz
+            ${{ runner.temp }}/ARCHIVE_SHA256.txt
+            ${{ runner.temp }}/SDK_FILE_SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
