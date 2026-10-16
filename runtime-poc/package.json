@@ -1,0 +1,14 @@
+{
+  "name": "perfetto-markdown-runtime-poc",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated runtime validation of Perfetto MCP chat markdown-it -> Mithril m.trust path",
+  "license": "UNLICENSED",
+  "scripts": {
+    "test": "node poc.js"
+  },
+  "dependencies": {
+    "markdown-it": "14.3.0",
+    "mithril": "2.3.8"
+  }
+}
