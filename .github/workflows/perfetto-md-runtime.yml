@@ -1,0 +1,65 @@
+name: Perfetto markdown runtime PoC
+
+on:
+  push:
+    branches:
+      - poc/perfetto-md-runtime-20261016-a3f7
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: runtime-poc
+    steps:
+      - name: Check out isolated PoC branch
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: runtime-poc/package.json
+
+      - name: Install exact dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+
+      - name: Record environment
+        run: |
+          set -euxo pipefail
+          node --version
+          npm --version
+          command -v google-chrome-stable || command -v google-chrome || command -v chromium || command -v chromium-browser
+          npm ls --all
+
+      - name: Run Chromium source-to-sink matrix
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee runtime-output.log
+
+      - name: Hash evidence
+        if: always()
+        run: |
+          sha256sum package.json package-lock.json poc.js runtime-evidence.json runtime-output.log 2>/dev/null | tee evidence-sha256.txt || true
+
+      - name: Upload runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perfetto-markdown-runtime-evidence
+          path: |
+            runtime-poc/runtime-evidence.json
+            runtime-poc/runtime-output.log
+            runtime-poc/evidence-sha256.txt
+            runtime-poc/package.json
+            runtime-poc/package-lock.json
+            runtime-poc/poc.js
+            runtime-poc/chrome-stderr.log
+          if-no-files-found: warn
+          retention-days: 14
